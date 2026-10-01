@@ -461,3 +461,107 @@ fn hash_str(h: &Header) -> String {
 fn script_id(c: &Connection, script: &ScriptBuf) -> rusqlite::Result<Option<i64>> {
     c.query_row("SELECT id FROM scripts WHERE script = ?1", [script.as_bytes()], |r| r.get(0)).optional()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        absolute::LockTime, block::Version as BlockVersion, transaction::Version, Amount, CompactTarget, OutPoint,
+        Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
+    };
+
+    const COIN: u64 = 100_000_000;
+
+    fn script(tag: u8) -> ScriptBuf {
+        let mut b = vec![0x00, 0x14];
+        b.extend([tag; 20]);
+        ScriptBuf::from_bytes(b)
+    }
+
+    fn tx(inputs: Vec<OutPoint>, outputs: Vec<(ScriptBuf, u64)>, tag: u8) -> Transaction {
+        let coinbase = inputs.is_empty();
+        let input = if coinbase {
+            vec![TxIn { previous_output: OutPoint::null(), script_sig: ScriptBuf::from_bytes(vec![1, tag]), sequence: Sequence::MAX, witness: Witness::new() }]
+        } else {
+            inputs.into_iter().map(|p| TxIn { previous_output: p, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }).collect()
+        };
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input,
+            output: outputs.into_iter().map(|(s, v)| TxOut { value: Amount::from_sat(v), script_pubkey: s }).collect(),
+        }
+    }
+
+    fn block(height: u64, prev: BlockHash, txdata: Vec<Transaction>) -> IndexedBlock {
+        let header = Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000 + height as u32,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: height as u32,
+        };
+        let block = Block { header, txdata };
+        IndexedBlock { height, size: consensus::serialize(&block).len(), block }
+    }
+
+    #[tokio::test]
+    async fn index_balances_history_and_rollback() {
+        let dir = std::env::temp_dir().join(format!("be-index-test-{}", std::process::id()));
+        let path = dir.join("t.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let mut w = open_writer(&path).unwrap();
+        assert_eq!(init_meta(&w, Network::Regtest, 1).unwrap(), 1);
+        assert!(init_meta(&w, Network::Bitcoin, 1).is_err(), "network mismatch must be refused");
+
+        let (a, b, miner) = (script(0xaa), script(0xbb), script(0xcc));
+        let cb1 = tx(vec![], vec![(a.clone(), 50 * COIN)], 1);
+        let b1 = block(1, BlockHash::all_zeros(), vec![cb1.clone()]);
+        // block 2: A spends 50 BTC -> 49 to B, 0.5 change to A, 0.5 fee to the miner
+        let spend = tx(vec![OutPoint::new(cb1.compute_txid(), 0)], vec![(b.clone(), 49 * COIN), (a.clone(), COIN / 2)], 0);
+        let cb2 = tx(vec![], vec![(miner.clone(), 50 * COIN + COIN / 2)], 2);
+        let b2 = block(2, b1.block.block_hash(), vec![cb2, spend.clone()]);
+        let b2_hash = b2.block.block_hash();
+        write_block(&mut w, &b1, Network::Regtest).unwrap();
+        write_block(&mut w, &b2, Network::Regtest).unwrap();
+        assert_eq!(tip(&w).unwrap().unwrap(), (2, b2_hash));
+
+        let idx = Arc::new(Index::open_reader(&path, Network::Regtest, IndexStatus::default()).unwrap());
+        let sa = idx.address_summary(a.clone(), 10).await.unwrap();
+        assert_eq!((sa.received_sat, sa.sent_sat, sa.balance_sat), (50 * COIN + COIN / 2, 50 * COIN, COIN / 2));
+        assert_eq!((sa.tx_count, sa.utxo_count), (2, 1));
+        assert_eq!(sa.unspents[0]["txid"], spend.compute_txid().to_string());
+        assert_eq!(idx.address_summary(b.clone(), 10).await.unwrap().balance_sat, 49 * COIN);
+
+        let hist = idx.address_txs(a.clone(), 0, 10).await.unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0]["txid"], spend.compute_txid().to_string()); // newest first
+        assert_eq!(hist[0]["net_sat"], -(49 * COIN as i64 + COIN as i64 / 2));
+        assert_eq!(hist[1]["net_sat"], 50 * COIN as i64);
+        assert_eq!(idx.address_txs(a.clone(), 1, 10).await.unwrap().len(), 1);
+
+        let loc = idx.tx_location(&spend.compute_txid().to_string()).await.unwrap();
+        assert_eq!(loc, Some((2, b2_hash.to_string())));
+        let pv = idx.prevouts(vec![(cb1.compute_txid().to_string(), 0), ("00".repeat(32), 0)]).await.unwrap();
+        assert_eq!(pv[0].as_ref().unwrap()["value"], 50.0);
+        assert!(pv[1].is_none());
+
+        let blk = idx.block_by_hash(&b2_hash.to_string()).await.unwrap().unwrap();
+        assert_eq!(blk["height"], 2);
+        assert_eq!(blk["tx_count"], 2);
+        assert_eq!(blk["fees_sat"], COIN / 2);
+        assert_eq!(blk["previous_hash"], b1.block.block_hash().to_string());
+
+        // Reorg: drop block 2. A gets its 50 BTC back, B never received anything.
+        rollback_from(&mut w, 2).unwrap();
+        let sa = idx.address_summary(a.clone(), 10).await.unwrap();
+        assert_eq!((sa.balance_sat, sa.tx_count, sa.utxo_count), (50 * COIN, 1, 1));
+        assert_eq!(idx.address_summary(b, 10).await.unwrap().tx_count, 0);
+        assert!(idx.tx_location(&spend.compute_txid().to_string()).await.unwrap().is_none());
+        assert_eq!(tip(&w).unwrap().unwrap().0, 1);
+
+        drop(w);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

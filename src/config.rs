@@ -129,3 +129,17 @@ pub fn parse_start(s: &str) -> Result<StartHeight, BoxError> {
         None => s.parse().map(StartHeight::Fixed).map_err(|_| bad().into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_height_forms() {
+        assert!(matches!(parse_start("840000").unwrap(), StartHeight::Fixed(840_000)));
+        assert!(matches!(parse_start(" tip-144 ").unwrap(), StartHeight::FromTip(144)));
+        assert!(parse_start("tip+1").is_err());
+        assert!(parse_start("-5").is_err());
+        assert!(parse_start("").is_err());
+    }
+}

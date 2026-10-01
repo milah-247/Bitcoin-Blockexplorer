@@ -391,3 +391,43 @@ fn jitter_ms() -> u64 {
         .unwrap_or(0);
     nanos as u64 % 200
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_result_ok_and_error() {
+        let v: u64 = decode_result(json!({ "result": 5, "error": null, "id": 1 })).unwrap();
+        assert_eq!(v, 5);
+        let e = decode_result::<u64>(json!({ "result": null, "error": { "code": -5, "message": "nope" } })).unwrap_err();
+        assert_eq!(e.code(), Some(-5));
+    }
+
+    #[test]
+    fn jsonrpc_detection() {
+        assert!(is_jsonrpc(&json!({ "result": null, "error": { "code": -1 } })));
+        assert!(is_jsonrpc(&json!([])));
+        // provider-level errors are not JSON-RPC responses
+        assert!(!is_jsonrpc(&json!({ "error": "Unauthorized", "message": "X-API-Key header is required" })));
+    }
+
+    #[test]
+    fn transient_errors() {
+        assert!(RpcError::Http { status: 429, message: String::new() }.is_transient());
+        assert!(RpcError::Http { status: 503, message: String::new() }.is_transient());
+        assert!(!RpcError::Http { status: 400, message: String::new() }.is_transient());
+        assert!(RpcError::Transport("reset".into()).is_transient());
+        assert!(RpcError::Rpc { code: -28, message: String::new() }.is_transient());
+        assert!(!RpcError::Rpc { code: -5, message: String::new() }.is_transient());
+        assert!(!RpcError::Timeout.is_transient());
+    }
+
+    #[test]
+    fn auth_debug_hides_secrets() {
+        let a = Auth::Basic { user: "u".into(), pass: "hunter2".into() };
+        assert!(!format!("{a:?}").contains("hunter2"));
+        let h = Auth::Header { name: HeaderName::from_static("x-api-key"), value: HeaderValue::from_static("secretkey") };
+        assert!(!format!("{h:?}").contains("secretkey"));
+    }
+}

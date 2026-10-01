@@ -63,3 +63,43 @@ impl IntoResponse for AppError {
         (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rpc(code: i64, msg: &str) -> RpcError {
+        RpcError::Rpc { code, message: msg.into() }
+    }
+
+    #[test]
+    fn rpc_errors_map_to_api_errors() {
+        assert!(matches!(AppError::from(rpc(-5, "x")), AppError::NotFound(_)));
+        assert!(matches!(AppError::from(rpc(-8, "Scan already in progress")), AppError::Busy(_)));
+        assert!(matches!(AppError::from(rpc(-8, "bad param")), AppError::InvalidInput(_)));
+        assert!(matches!(AppError::from(rpc(-28, "Loading")), AppError::Busy(_)));
+        assert!(matches!(AppError::from(rpc(-32601, "Method not found")), AppError::NotSupported(_)));
+        assert!(matches!(AppError::from(rpc(-1, "?")), AppError::Upstream(_)));
+        let http = |status, m: &str| RpcError::Http { status, message: m.into() };
+        assert!(matches!(AppError::from(http(429, "")), AppError::RateLimited(_)));
+        assert!(matches!(AppError::from(http(400, "Method \"x\" is not permitted")), AppError::NotSupported(_)));
+        assert!(matches!(AppError::from(RpcError::Timeout), AppError::Timeout(_)));
+        // credentials problems never leak details
+        match AppError::from(http(401, "bad key abc123")) {
+            AppError::Upstream(m) => assert!(!m.contains("abc123")),
+            e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn status_codes() {
+        let s = |e: AppError| e.into_response().status().as_u16();
+        assert_eq!(s(AppError::NotFound("".into())), 404);
+        assert_eq!(s(AppError::InvalidInput("".into())), 400);
+        assert_eq!(s(AppError::Busy("".into())), 503);
+        assert_eq!(s(AppError::RateLimited("".into())), 503);
+        assert_eq!(s(AppError::NotSupported("".into())), 501);
+        assert_eq!(s(AppError::Upstream("".into())), 502);
+        assert_eq!(s(AppError::Timeout("".into())), 504);
+    }
+}

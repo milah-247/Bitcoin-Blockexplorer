@@ -54,8 +54,14 @@ pub fn build(state: AppState, http: &HttpSettings) -> Router {
             })
             .on_request(())
             .on_response(|res: &Response, latency: Duration, _span: &tracing::Span| {
-                tracing::info!(status = res.status().as_u16(), latency_ms = latency.as_millis() as u64, "response");
-            }),
+                let (status, latency_ms) = (res.status().as_u16(), latency.as_millis() as u64);
+                if status >= 500 {
+                    tracing::warn!(status, latency_ms, "response");
+                } else {
+                    tracing::info!(status, latency_ms, "response");
+                }
+            })
+            .on_failure(()),
     );
     if let Some(cors) = cors_layer(http.cors_origins.as_deref()) {
         app = app.layer(cors);

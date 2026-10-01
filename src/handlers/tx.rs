@@ -124,3 +124,76 @@ pub async fn tx_detail(State(st): State<AppState>, Path(txid): Path<String>, Q(q
     }
     Ok(Json(tx_json(&tx)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spk(addr: &str) -> Value {
+        json!({ "address": addr, "type": "witness_v0_keyhash" })
+    }
+
+    #[test]
+    fn confirmed_tx_fee_and_rate() {
+        let tx = json!({
+            "txid": "t", "blockhash": "b", "height": 10, "time": 1700000000, "confirmations": 3,
+            "size": 222, "vsize": 141, "weight": 561, "version": 2, "locktime": 0,
+            "vin": [{ "txid": "p", "vout": 1, "prevout": { "value": 0.024942, "scriptPubKey": spk("in1") } }],
+            "vout": [
+                { "n": 0, "value": 0.012, "scriptPubKey": spk("out0") },
+                { "n": 1, "value": 0.012871, "scriptPubKey": spk("out1") }
+            ]
+        });
+        let j = tx_json(&tx);
+        assert_eq!(j["fee_sat"], 7100);
+        assert_eq!(j["fee_rate_sat_vb"], 50.35);
+        assert_eq!(j["status"]["confirmed"], true);
+        assert_eq!(j["status"]["confirmations"], 3);
+        assert_eq!(j["status"]["block_height"], 10);
+        assert_eq!(j["inputs"][0]["address"], "in1");
+        assert_eq!(j["inputs"][0]["value_sat"], 2_494_200);
+        assert_eq!(j["outputs"][1]["value_sat"], 1_287_100);
+        assert_eq!(j["is_coinbase"], false);
+    }
+
+    #[test]
+    fn coinbase_has_no_fee() {
+        let tx = json!({
+            "txid": "c", "vsize": 100,
+            "vin": [{ "coinbase": "03aabbcc" }],
+            "vout": [{ "n": 0, "value": 3.125, "scriptPubKey": spk("miner") }]
+        });
+        let j = tx_json(&tx);
+        assert_eq!(j["is_coinbase"], true);
+        assert!(j["fee_sat"].is_null());
+        assert!(j["fee_rate_sat_vb"].is_null());
+        assert_eq!(j["inputs"][0]["coinbase"], true);
+        assert_eq!(j["status"]["confirmed"], false);
+    }
+
+    #[test]
+    fn unknown_prevout_falls_back_to_node_fee() {
+        let tx = json!({
+            "txid": "m", "vsize": 200, "fee": 0.00002,
+            "vin": [{ "txid": "p", "vout": 0 }],
+            "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": spk("x") }]
+        });
+        let j = tx_json(&tx);
+        assert!(j["inputs"][0]["value_sat"].is_null());
+        assert_eq!(j["fee_sat"], 2000);
+        assert_eq!(j["fee_rate_sat_vb"], 10.0);
+    }
+
+    #[test]
+    fn unknown_prevout_without_node_fee_is_null() {
+        let tx = json!({
+            "txid": "m", "vsize": 200,
+            "vin": [{ "txid": "p", "vout": 0 }],
+            "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "type": "nulldata" } }]
+        });
+        let j = tx_json(&tx);
+        assert!(j["fee_sat"].is_null());
+        assert!(j["outputs"][0]["address"].is_null());
+        assert_eq!(j["outputs"][0]["script_type"], "nulldata");
+    }
+}
