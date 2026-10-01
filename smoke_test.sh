@@ -3,19 +3,21 @@ set -u
 
 API=${API:-http://127.0.0.1:3000}
 CLI="bitcoin-cli -regtest"
+RESP=$(mktemp)
+trap 'rm -f "$RESP"' EXIT
 pass=0
 fail=0
 
 check() { # name expected_status path
   local name=$1 want=$2 path=$3
   local got
-  got=$(curl -s -o /tmp/resp.json -w '%{http_code}' "$API$path")
+  got=$(curl -s -o "$RESP" -w '%{http_code}' "$API$path")
   if [ "$got" = "$want" ]; then
     echo "PASS  $name ($got)"
     pass=$((pass + 1))
   else
     echo "FAIL  $name: expected $want, got $got"
-    cat /tmp/resp.json; echo
+    cat "$RESP"; echo
     fail=$((fail + 1))
   fi
 }
@@ -49,6 +51,9 @@ check "search height"          200 "/api/search?q=1"
 check "search block hash"      200 "/api/search?q=$HASH1"
 check "search txid"            200 "/api/search?q=$TXID"
 check "search address"         200 "/api/search?q=$ADDR"
+check "address txs"            200 "/api/address/$ADDR/txs?limit=5"
+check "health"                 200 "/api/health"
+check "frontend"               200 "/"
 
 echo; echo "== Error checks =="
 check "block not found"        404 "/api/block/99999"

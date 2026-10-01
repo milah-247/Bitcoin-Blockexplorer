@@ -3,40 +3,49 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bitcoincore_rpc::{jsonrpc, Error as RpcError};
 use serde_json::json;
 
-#[derive(Debug)]
+use crate::rpc::RpcError;
+
+#[derive(Debug, Clone)]
 pub enum AppError {
     NotFound(String),
     InvalidInput(String),
-    /// Node is busy (e.g. another scantxoutset is running)
+    /// Node is busy (scan in progress, warming up) or the provider rate-limited us
     Busy(String),
+    RateLimited(String),
+    /// The node/provider does not allow the RPC method this feature needs
+    NotSupported(String),
     /// Node returned an error or is unreachable
     Upstream(String),
-    Internal(String),
-}
-
-/// Extract the JSON-RPC error code, if the error came from the node.
-pub fn rpc_code(e: &RpcError) -> Option<i32> {
-    match e {
-        RpcError::JsonRpc(jsonrpc::Error::Rpc(r)) => Some(r.code),
-        _ => None,
-    }
+    /// Node (or the whole request) took too long
+    Timeout(String),
 }
 
 impl From<RpcError> for AppError {
     fn from(e: RpcError) -> Self {
-        if let RpcError::JsonRpc(jsonrpc::Error::Rpc(r)) = &e {
-            let msg = r.message.clone();
-            return match r.code {
-                -5 => AppError::NotFound(msg),
-                -8 if msg.contains("in progress") => AppError::Busy(msg),
-                -8 => AppError::InvalidInput(msg),
-                _ => AppError::Upstream(msg),
-            };
+        match e {
+            RpcError::Rpc { code, message } => match code {
+                -5 => AppError::NotFound(message),
+                -8 if message.contains("in progress") => AppError::Busy(message),
+                -8 => AppError::InvalidInput(message),
+                -28 => AppError::Busy(format!("node is starting up: {message}")),
+                -32601 => AppError::NotSupported(message),
+                _ => AppError::Upstream(message),
+            },
+            RpcError::Http { status: 429, .. } => {
+                AppError::RateLimited("RPC provider rate limit reached, try again shortly".into())
+            }
+            RpcError::Http { status: 400, message } if message.contains("not permitted") => {
+                AppError::NotSupported(format!("the RPC provider does not allow this: {message}"))
+            }
+            // Don't echo auth details back to API clients.
+            RpcError::Http { status: 401 | 403, .. } => {
+                AppError::Upstream("RPC provider rejected our credentials".into())
+            }
+            RpcError::Timeout => AppError::Timeout("node did not answer in time".into()),
+            e => AppError::Upstream(e.to_string()),
         }
-        AppError::Upstream(e.to_string())
     }
 }
 
@@ -46,9 +55,51 @@ impl IntoResponse for AppError {
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m),
             AppError::InvalidInput(m) => (StatusCode::BAD_REQUEST, "invalid_input", m),
             AppError::Busy(m) => (StatusCode::SERVICE_UNAVAILABLE, "node_busy", m),
+            AppError::RateLimited(m) => (StatusCode::SERVICE_UNAVAILABLE, "rate_limited", m),
+            AppError::NotSupported(m) => (StatusCode::NOT_IMPLEMENTED, "not_supported", m),
             AppError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream_error", m),
-            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m),
+            AppError::Timeout(m) => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", m),
         };
         (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rpc(code: i64, msg: &str) -> RpcError {
+        RpcError::Rpc { code, message: msg.into() }
+    }
+
+    #[test]
+    fn rpc_errors_map_to_api_errors() {
+        assert!(matches!(AppError::from(rpc(-5, "x")), AppError::NotFound(_)));
+        assert!(matches!(AppError::from(rpc(-8, "Scan already in progress")), AppError::Busy(_)));
+        assert!(matches!(AppError::from(rpc(-8, "bad param")), AppError::InvalidInput(_)));
+        assert!(matches!(AppError::from(rpc(-28, "Loading")), AppError::Busy(_)));
+        assert!(matches!(AppError::from(rpc(-32601, "Method not found")), AppError::NotSupported(_)));
+        assert!(matches!(AppError::from(rpc(-1, "?")), AppError::Upstream(_)));
+        let http = |status, m: &str| RpcError::Http { status, message: m.into() };
+        assert!(matches!(AppError::from(http(429, "")), AppError::RateLimited(_)));
+        assert!(matches!(AppError::from(http(400, "Method \"x\" is not permitted")), AppError::NotSupported(_)));
+        assert!(matches!(AppError::from(RpcError::Timeout), AppError::Timeout(_)));
+        // credentials problems never leak details
+        match AppError::from(http(401, "bad key abc123")) {
+            AppError::Upstream(m) => assert!(!m.contains("abc123")),
+            e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn status_codes() {
+        let s = |e: AppError| e.into_response().status().as_u16();
+        assert_eq!(s(AppError::NotFound("".into())), 404);
+        assert_eq!(s(AppError::InvalidInput("".into())), 400);
+        assert_eq!(s(AppError::Busy("".into())), 503);
+        assert_eq!(s(AppError::RateLimited("".into())), 503);
+        assert_eq!(s(AppError::NotSupported("".into())), 501);
+        assert_eq!(s(AppError::Upstream("".into())), 502);
+        assert_eq!(s(AppError::Timeout("".into())), 504);
     }
 }
