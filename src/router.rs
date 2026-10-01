@@ -33,6 +33,7 @@ pub fn build(state: AppState, http: &HttpSettings) -> Router {
         .route("/api/block/:id/txs", get(blocks::block_txs))
         .route("/api/tx/:txid", get(tx::tx_detail))
         .route("/api/address/:addr", get(address::address_detail))
+        .route("/api/address/:addr/txs", get(address::address_txs))
         .route("/api/search", get(search::search))
         .fallback(|| async { AppError::NotFound("no such API endpoint".into()) })
         .layer(middleware::from_fn_with_state(http.request_timeout, timeout))

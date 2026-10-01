@@ -5,6 +5,8 @@ mod config;
 mod error;
 mod extract;
 mod handlers;
+mod index;
+mod indexer;
 mod router;
 mod rpc;
 mod state;
@@ -50,11 +52,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rpc = Arc::new(rpc::Rpc::new(cfg.rpc.clone())?);
     tracing::info!(network = %cfg.network, rpc = %rpc.safe_url(), auth = ?cfg.rpc.auth, "starting");
+    let index = match &cfg.index {
+        Some(s) => Some(indexer::spawn(rpc.clone(), cfg.network, s.clone())?),
+        None => {
+            tracing::info!("address index disabled; /api/address falls back to scantxoutset");
+            None
+        }
+    };
     let state = AppState {
         rpc,
         network: cfg.network,
         cache: Arc::new(cache::Cache::new(cfg.cache.clone())),
         started: Instant::now(),
+        index,
     };
     let app = router::build(state, &cfg.http);
 

@@ -113,6 +113,11 @@ impl AppState {
     pub async fn block(&self, hash: &str) -> Result<Arc<Value>, AppError> {
         self.cache
             .get_or(&format!("b:{hash}"), async {
+                if let Some(idx) = &self.index {
+                    if let Some(b) = idx.block_by_hash(hash).await? {
+                        return Ok((b, Ttl::Long));
+                    }
+                }
                 let b: Value = self
                     .rpc
                     .call_timeout("getblock", &[json!(hash), json!(1)], HEAVY_TIMEOUT)
@@ -131,10 +136,17 @@ impl AppState {
         let mut out: Vec<Option<Arc<Value>>> = vec![None; hashes.len()];
         let mut missing = Vec::new();
         for (i, h) in hashes.iter().enumerate() {
-            match self.cache.get(&format!("b:{h}")).await {
-                Some(v) => out[i] = Some(v),
-                None => missing.push(i),
+            if let Some(v) = self.cache.get(&format!("b:{h}")).await {
+                out[i] = Some(v);
+                continue;
             }
+            if let Some(idx) = &self.index {
+                if let Some(b) = idx.block_by_hash(h).await? {
+                    out[i] = Some(self.cache.put(format!("b:{h}"), b, Ttl::Long).await);
+                    continue;
+                }
+            }
+            missing.push(i);
         }
         if !missing.is_empty() {
             let calls: Vec<(&str, Vec<Value>)> =
@@ -152,6 +164,9 @@ impl AppState {
     /// allow `getblockstats`). Under-reports if a miner claimed less than allowed,
     /// which is rare. Returns None rather than failing the whole page.
     pub async fn block_fees(&self, block: &Value) -> Option<u64> {
+        if let Some(f) = block["fees_sat"].as_u64() {
+            return Some(f); // from the index
+        }
         let height = block["height"].as_u64()?;
         if height == 0 {
             return Some(0); // genesis coinbase is not a retrievable transaction
@@ -195,6 +210,11 @@ impl AppState {
         if let Some(v) = self.cache.get(&key).await {
             return Ok(v);
         }
+        let block_hint = match (block_hint, &self.index) {
+            (Some(h), _) => Some(h),
+            (None, Some(idx)) => idx.tx_location(txid).await?.map(|(_, hash)| hash),
+            (None, None) => None,
+        };
         let mut params = vec![json!(txid), json!(2)];
         if let Some(bh) = &block_hint {
             params.push(json!(bh));
@@ -205,10 +225,16 @@ impl AppState {
                 return Err(AppError::NotFound(if block_hint.is_some() {
                     "transaction not found in the given block".into()
                 } else {
-                    "transaction not found in the mempool. This node has no transaction index, \
-                     so a confirmed transaction can only be looked up together with its block \
-                     (open it from the block page, or add ?block=<height or hash>)"
-                        .into()
+                    let range = self.index.as_ref().map(|i| {
+                        let s = i.status();
+                        format!(" or in indexed blocks {}-{}", s.start_height, s.indexed_height.map(|h| h.to_string()).unwrap_or("…".into()))
+                    });
+                    format!(
+                        "transaction not found in the mempool{}. This node has no transaction index, \
+                         so other confirmed transactions can only be looked up together with their block \
+                         (open it from the block page, or add ?block=<height or hash>)",
+                        range.unwrap_or_default()
+                    )
                 }));
             }
             Err(e) => return Err(e.into()),
@@ -233,6 +259,24 @@ impl AppState {
     /// themselves retrievable (in the mempool, or any tx on a txindex node) in one
     /// batch, then fall back to the mempool entry for the fee.
     async fn fill_mempool_prevouts(&self, tx: &mut Value) {
+        let Some(vin) = tx["vin"].as_array() else { return };
+        // Parents inside the indexed range come from SQLite for free.
+        if let Some(idx) = &self.index {
+            let want: Vec<(usize, String, u64)> = vin
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.get("prevout").is_none() && i.get("coinbase").is_none())
+                .filter_map(|(n, i)| Some((n, i["txid"].as_str()?.to_string(), i["vout"].as_u64()?)))
+                .collect();
+            let ops = want.iter().map(|(_, t, v)| (t.clone(), *v)).collect();
+            if let Ok(found) = idx.prevouts(ops).await {
+                for ((n, _, _), p) in want.iter().zip(found) {
+                    if let Some(p) = p {
+                        tx["vin"][*n]["prevout"] = p;
+                    }
+                }
+            }
+        }
         let Some(vin) = tx["vin"].as_array() else { return };
         let wanted: Vec<(usize, String, u64)> = vin
             .iter()

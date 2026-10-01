@@ -4,6 +4,7 @@ use bitcoin::Network;
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::cache::CacheSettings;
+use crate::indexer::{IndexerSettings, StartHeight};
 use crate::router::HttpSettings;
 use crate::rpc::{Auth, RpcSettings};
 
@@ -16,6 +17,8 @@ pub struct Config {
     pub bind: String,
     pub http: HttpSettings,
     pub cache: CacheSettings,
+    /// None when INDEX_ENABLED=false
+    pub index: Option<IndexerSettings>,
 }
 
 /// Load `.env` (or the file named by `ENV_FILE`; `ENV_FILE=none` skips it).
@@ -95,7 +98,33 @@ impl Config {
             tip: Duration::from_secs(env_or("CACHE_TTL_TIP_SECS", 5u64)?),
         };
 
+        let index = if env_or("INDEX_ENABLED", true)? {
+            let default_start = if network == Network::Regtest { "0" } else { "tip-144" };
+            let start = env::var("START_HEIGHT").unwrap_or_else(|_| default_start.into());
+            Some(IndexerSettings {
+                path: env::var("INDEX_DB_PATH")
+                    .unwrap_or_else(|_| format!("data/index-{network}.sqlite"))
+                    .into(),
+                start: parse_start(&start)?,
+                concurrency: env_or("INDEX_CONCURRENCY", 2usize)?.clamp(1, 8),
+                poll: Duration::from_secs(env_or("INDEX_POLL_SECS", 15u64)?),
+                max_reorg: env_or("INDEX_MAX_REORG", 100u64)?,
+            })
+        } else {
+            None
+        };
+
         let bind = env::var("BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
-        Ok(Config { rpc, network, bind, http, cache })
+        Ok(Config { rpc, network, bind, http, cache, index })
+    }
+}
+
+/// `START_HEIGHT=840000` or `START_HEIGHT=tip-1000`.
+pub fn parse_start(s: &str) -> Result<StartHeight, BoxError> {
+    let s = s.trim();
+    let bad = || format!("invalid START_HEIGHT `{s}` (use a height or tip-N)");
+    match s.strip_prefix("tip-") {
+        Some(n) => n.parse().map(StartHeight::FromTip).map_err(|_| bad().into()),
+        None => s.parse().map(StartHeight::Fixed).map_err(|_| bad().into()),
     }
 }
