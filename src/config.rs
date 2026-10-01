@@ -85,6 +85,7 @@ impl Config {
 
         let http = HttpSettings {
             request_timeout: Duration::from_secs(env_or("REQUEST_TIMEOUT_SECS", 120u64)?),
+            frontend_dir: env::var("FRONTEND_DIR").unwrap_or_else(|_| "frontend".into()),
             cors_origins: env::var("CORS_ORIGINS").ok().and_then(|v| {
                 let list: Vec<String> =
                     v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();

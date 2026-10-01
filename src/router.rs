@@ -10,6 +10,7 @@ use axum::{
 };
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 
@@ -21,6 +22,8 @@ pub struct HttpSettings {
     pub request_timeout: Duration,
     /// None: no CORS headers (same-origin only). Some(["*"]): any origin.
     pub cors_origins: Option<Vec<String>>,
+    /// Static frontend directory served at `/`
+    pub frontend_dir: String,
 }
 
 /// All HTTP routes in one place.
@@ -35,11 +38,15 @@ pub fn build(state: AppState, http: &HttpSettings) -> Router {
         .route("/api/address/:addr", get(address::address_detail))
         .route("/api/address/:addr/txs", get(address::address_txs))
         .route("/api/search", get(search::search))
-        .fallback(|| async { AppError::NotFound("no such API endpoint".into()) })
+        .route("/api/*rest", get(|| async { AppError::NotFound("no such API endpoint".into()) }))
         .layer(middleware::from_fn_with_state(http.request_timeout, timeout))
         .with_state(state);
 
-    let mut app = Router::new().merge(api).layer(
+    // Everything outside /api is the static frontend (hash routing, so one page).
+    let index = format!("{}/index.html", http.frontend_dir);
+    let frontend = ServeDir::new(&http.frontend_dir).not_found_service(ServeFile::new(index));
+
+    let mut app = Router::new().merge(api).fallback_service(frontend).layer(
         TraceLayer::new_for_http()
             // Path only: query strings never carry secrets here, but keep logs lean.
             .make_span_with(|req: &Request| {
