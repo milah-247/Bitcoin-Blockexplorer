@@ -1,13 +1,16 @@
+mod cache;
+mod chain;
 mod check;
 mod config;
 mod error;
+mod extract;
 mod handlers;
 mod router;
 mod rpc;
 mod state;
 mod util;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use state::AppState;
 
@@ -45,14 +48,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unknown argument `{a}`\n\n{USAGE}").into());
     }
 
+    let rpc = Arc::new(rpc::Rpc::new(cfg.rpc.clone())?);
+    tracing::info!(network = %cfg.network, rpc = %rpc.safe_url(), auth = ?cfg.rpc.auth, "starting");
     let state = AppState {
-        rpc: Arc::new(cfg.legacy_client()?),
+        rpc,
         network: cfg.network,
+        cache: Arc::new(cache::Cache::new(cfg.cache.clone())),
+        started: Instant::now(),
     };
-    let app = router::build(state);
+    let app = router::build(state, &cfg.http);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
-    println!("block-explorer ({}) listening on http://{}", cfg.network, cfg.bind);
+    tracing::info!("block-explorer ({}) listening on http://{}", cfg.network, cfg.bind);
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -204,6 +204,10 @@ impl Rpc {
         *self.last_rate.lock().unwrap()
     }
 
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: &[Value]) -> Result<T, RpcError> {
         self.call_timeout(method, params, self.timeout).await
     }
@@ -225,6 +229,7 @@ impl Rpc {
     pub async fn batch<T: DeserializeOwned>(
         &self,
         calls: &[(&str, Vec<Value>)],
+        timeout: Duration,
     ) -> Result<Vec<Result<T, RpcError>>, RpcError> {
         if calls.is_empty() {
             return Ok(Vec::new());
@@ -234,7 +239,7 @@ impl Rpc {
             .enumerate()
             .map(|(i, (m, p))| json!({ "jsonrpc": "1.0", "id": i, "method": m, "params": p }))
             .collect();
-        let v = self.send("batch", &Value::Array(body), self.timeout).await?;
+        let v = self.send("batch", &Value::Array(body), timeout).await?;
         let Value::Array(items) = v else {
             return Err(RpcError::Decode("batch response is not an array".into()));
         };

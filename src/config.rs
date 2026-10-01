@@ -1,12 +1,10 @@
 use std::{env, time::Duration};
 
 use bitcoin::Network;
-use bitcoincore_rpc::{
-    jsonrpc::{self, simple_http::SimpleHttpTransport},
-    Client,
-};
 use reqwest::header::{HeaderName, HeaderValue};
 
+use crate::cache::CacheSettings;
+use crate::router::HttpSettings;
 use crate::rpc::{Auth, RpcSettings};
 
 type BoxError = Box<dyn std::error::Error>;
@@ -16,6 +14,8 @@ pub struct Config {
     pub rpc: RpcSettings,
     pub network: Network,
     pub bind: String,
+    pub http: HttpSettings,
+    pub cache: CacheSettings,
 }
 
 /// Load `.env` (or the file named by `ENV_FILE`; `ENV_FILE=none` skips it).
@@ -80,21 +80,22 @@ impl Config {
             rate_per_min: env_or("RPC_RATE_LIMIT_PER_MIN", 0u32)?,
         };
 
-        let bind = env::var("BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
-        Ok(Config { rpc, network, bind })
-    }
-
-    /// Blocking bitcoincore-rpc client used by the handlers (plain HTTP + Basic auth only).
-    pub fn legacy_client(&self) -> Result<Client, BoxError> {
-        let Auth::Basic { user, pass } = &self.rpc.auth else {
-            return Err("the HTTP handlers do not support API-key auth yet; only --check does".into());
+        let http = HttpSettings {
+            request_timeout: Duration::from_secs(env_or("REQUEST_TIMEOUT_SECS", 120u64)?),
+            cors_origins: env::var("CORS_ORIGINS").ok().and_then(|v| {
+                let list: Vec<String> =
+                    v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                (!list.is_empty()).then_some(list)
+            }),
         };
-        // Long timeout: scantxoutset can take minutes on mainnet.
-        let transport = SimpleHttpTransport::builder()
-            .url(&self.rpc.url)?
-            .auth(user.clone(), Some(pass.clone()))
-            .timeout(Duration::from_secs(600))
-            .build();
-        Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(transport)))
+        let cache = CacheSettings {
+            max_bytes: env_or("CACHE_MAX_MB", 256u64)? * 1024 * 1024,
+            long: Duration::from_secs(env_or("CACHE_TTL_LONG_SECS", 86_400u64)?),
+            short: Duration::from_secs(env_or("CACHE_TTL_SHORT_SECS", 15u64)?),
+            tip: Duration::from_secs(env_or("CACHE_TTL_TIP_SECS", 5u64)?),
+        };
+
+        let bind = env::var("BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+        Ok(Config { rpc, network, bind, http, cache })
     }
 }

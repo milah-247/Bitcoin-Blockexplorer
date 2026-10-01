@@ -1,24 +1,27 @@
 use axum::{
-    extract::{Query, State},
+    extract::State,
     Json,
 };
-use bitcoincore_rpc::RpcApi;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::error::{rpc_code, AppError};
-use crate::state::{rpc_call, ApiResult, AppState};
-use crate::util::{is_digits, is_hash, parse_address};
+use crate::error::AppError;
+use crate::extract::Q;
+use crate::state::{ApiResult, AppState};
+use crate::util::{is_digits, is_hash, parse_address, MAX_INPUT_LEN};
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
     q: Option<String>,
 }
 
-pub async fn search(State(st): State<AppState>, Query(sq): Query<SearchQuery>) -> ApiResult {
+pub async fn search(State(st): State<AppState>, Q(sq): Q<SearchQuery>) -> ApiResult {
     let q = sq.q.unwrap_or_default().trim().to_string();
     if q.is_empty() {
         return Err(AppError::InvalidInput("missing query parameter `q`".into()));
+    }
+    if q.len() > MAX_INPUT_LEN {
+        return Err(AppError::InvalidInput("query is too long".into()));
     }
 
     // 1. block height
@@ -26,33 +29,32 @@ pub async fn search(State(st): State<AppState>, Query(sq): Query<SearchQuery>) -
         let h: u64 = q
             .parse()
             .map_err(|_| AppError::InvalidInput("height out of range".into()))?;
-        let tip: u64 = rpc_call(&st, |c| c.call("getblockcount", &[])).await?;
+        let tip = st.tip().await?.height;
         if h > tip {
             return Err(AppError::NotFound(format!("no block at height {h} (tip is {tip})")));
         }
         return Ok(Json(json!({ "type": "block", "value": h, "path": format!("/api/block/{h}") })));
     }
 
-    // 2. 64 hex chars: block hash first (cheap), then txid
+    // 2. 64 hex chars: block hash first, then txid. Both lookups are cached, so the
+    //    page the client opens next is served without another RPC call.
     if is_hash(&q) {
         let hash = q.to_ascii_lowercase();
-        let h = hash.clone();
-        let kind = rpc_call(&st, move |c| {
-            match c.call::<Value>("getblockheader", &[json!(h)]) {
-                Ok(_) => return Ok(Some("block")),
-                Err(e) if rpc_code(&e) == Some(-5) => {}
-                Err(e) => return Err(e),
+        match st.block(&hash).await {
+            Ok(_) => {
+                return Ok(Json(json!({ "type": "block", "value": hash, "path": format!("/api/block/{hash}") })))
             }
-            match c.call::<Value>("getrawtransaction", &[json!(h), json!(false)]) {
-                Ok(_) => Ok(Some("tx")),
-                Err(e) if rpc_code(&e) == Some(-5) => Ok(None),
-                Err(e) => Err(e),
-            }
-        })
-        .await?;
-        return match kind {
-            Some(k) => Ok(Json(json!({ "type": k, "value": hash, "path": format!("/api/{k}/{hash}") }))),
-            None => Err(AppError::NotFound("no block or transaction with that hash".into())),
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        return match st.tx(&hash, None).await {
+            Ok(_) => Ok(Json(json!({ "type": "tx", "value": hash, "path": format!("/api/tx/{hash}") }))),
+            Err(AppError::NotFound(_)) => Err(AppError::NotFound(
+                "no block or transaction with that hash. Without a transaction index, \
+                 only blocks and mempool transactions can be found by hash"
+                    .into(),
+            )),
+            Err(e) => Err(e),
         };
     }
 

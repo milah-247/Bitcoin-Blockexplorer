@@ -2,50 +2,22 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use bitcoincore_rpc::{Client, RpcApi};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::AppError;
-use crate::state::{rpc_call, ApiResult, AppState, RpcResult};
-use crate::util::{is_hash, sats};
+use crate::extract::Q;
+use crate::state::{ApiResult, AppState};
+use crate::util::{parse_block_id, parse_hash, sats, BlockId};
 
-/// Fetch a tx as JSON with `vin[].prevout` filled in.
-/// Confirmed: pull it out of `getblock` verbosity 3 (Core 25+), which includes prevouts.
-/// Unconfirmed: fetch each parent tx to get the spent outputs.
-fn fetch_tx(c: &Client, txid: &str) -> RpcResult<Value> {
-    let raw: Value = c.call("getrawtransaction", &[json!(txid), json!(true)])?;
-
-    if let Some(bh) = raw["blockhash"].as_str() {
-        let block: Value = c.call("getblock", &[json!(bh), json!(3)])?;
-        let found = block["tx"]
-            .as_array()
-            .and_then(|a| a.iter().find(|t| t["txid"].as_str() == Some(txid)));
-        if let Some(t) = found {
-            let mut tx = t.clone();
-            tx["blockhash"] = json!(bh);
-            tx["height"] = block["height"].clone();
-            tx["confirmations"] = raw["confirmations"].clone();
-            tx["time"] = raw["blocktime"].clone();
-            return Ok(tx);
-        }
-    }
-
-    let mut tx = raw;
-    if let Some(vin) = tx["vin"].as_array_mut() {
-        for i in vin {
-            let (Some(ptxid), Some(n)) = (i["txid"].as_str().map(String::from), i["vout"].as_u64())
-            else {
-                continue; // coinbase
-            };
-            let parent: Value = c.call("getrawtransaction", &[json!(ptxid), json!(true)])?;
-            let o = &parent["vout"][n as usize];
-            i["prevout"] = json!({ "value": o["value"], "scriptPubKey": o["scriptPubKey"] });
-        }
-    }
-    Ok(tx)
+#[derive(Deserialize)]
+pub struct TxQuery {
+    /// Height or hash of the block containing the tx (needed without a txindex).
+    block: Option<String>,
 }
 
-/// Turn a raw node transaction into the API response shape.
+/// Turn a node transaction (verbosity 2, `vin[].prevout` filled where known)
+/// into the API response shape.
 pub fn tx_json(tx: &Value) -> Value {
     let (mut in_sum, mut out_sum) = (0u64, 0u64);
     let (mut coinbase, mut complete) = (false, true);
@@ -70,6 +42,7 @@ pub fn tx_json(tx: &Value) -> Value {
                 "txid": i["txid"],
                 "vout": i["vout"],
                 "address": pv["scriptPubKey"]["address"],
+                "script_type": pv["scriptPubKey"]["type"],
                 "value_sat": val,
             })
         })
@@ -92,7 +65,19 @@ pub fn tx_json(tx: &Value) -> Value {
         })
         .collect();
 
-    let fee = if coinbase || !complete { None } else { in_sum.checked_sub(out_sum) };
+    let fee = if coinbase {
+        None
+    } else if complete {
+        in_sum.checked_sub(out_sum)
+    } else {
+        // Node-reported fee (verbosity 2, or the mempool entry) when some prevouts are unknown.
+        tx.get("fee").filter(|f| f.is_number()).map(sats)
+    };
+    let vsize = tx["vsize"].as_u64();
+    let fee_rate = match (fee, vsize) {
+        (Some(f), Some(v)) if v > 0 => Some((f as f64 / v as f64 * 100.0).round() / 100.0),
+        _ => None,
+    };
     let confirmed = tx["blockhash"].is_string();
 
     json!({
@@ -107,18 +92,35 @@ pub fn tx_json(tx: &Value) -> Value {
         "size": tx["size"],
         "vsize": tx["vsize"],
         "weight": tx["weight"],
+        "version": tx["version"],
+        "locktime": tx["locktime"],
         "is_coinbase": coinbase,
         "fee_sat": fee,
+        "fee_rate_sat_vb": fee_rate,
         "inputs": inputs,
         "outputs": outputs,
     })
 }
 
-pub async fn tx_detail(State(st): State<AppState>, Path(txid): Path<String>) -> ApiResult {
-    if !is_hash(&txid) {
-        return Err(AppError::InvalidInput("txid must be 64 hex characters".into()));
+pub async fn tx_detail(State(st): State<AppState>, Path(txid): Path<String>, Q(q): Q<TxQuery>) -> ApiResult {
+    let txid = parse_hash(&txid, "txid")?;
+    let hint = match q.block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(b) => Some(match parse_block_id(b)? {
+            BlockId::Hash(h) => h,
+            BlockId::Height(h) => st
+                .hash_at(h)
+                .await?
+                .ok_or_else(|| AppError::NotFound("block not found".into()))?,
+        }),
+    };
+    let cached = st.tx(&txid, hint).await?;
+    let mut tx = (*cached).clone();
+
+    // Confirmations change as blocks arrive; compute them fresh.
+    if let (Some(h), Some(bh)) = (tx["height"].as_u64(), tx["blockhash"].as_str().map(String::from)) {
+        let tip = st.tip().await?;
+        tx["confirmations"] = json!(st.confirmations(&tip, h, &bh).await?.max(0));
     }
-    let txid = txid.to_ascii_lowercase();
-    let tx = rpc_call(&st, move |c| fetch_tx(c, &txid)).await?;
     Ok(Json(tx_json(&tx)))
 }

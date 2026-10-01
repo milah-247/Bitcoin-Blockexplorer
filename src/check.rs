@@ -302,7 +302,7 @@ pub async fn run(rpc: &Rpc, network: Network, real_scan: bool) -> bool {
     // 7. JSON-RPC batching and rate limit -------------------------------------------
     let before = rpc.rate_limit();
     let calls: Vec<(&str, Vec<Value>)> = (0..5).map(|i| ("getblockhash", vec![json!(i)])).collect();
-    match rpc.batch::<String>(&calls).await {
+    match rpc.batch::<String>(&calls, rpc.timeout()).await {
         Ok(res) => {
             let ok = res.iter().filter(|x| x.is_ok()).count();
             let cost = match (before, rpc.rate_limit()) {
@@ -314,7 +314,7 @@ pub async fn run(rpc: &Rpc, network: Network, real_scan: bool) -> bool {
         Err(e) => r.add("JSON-RPC batch", Status::No, err_detail(&e)),
     }
     let calls: Vec<(&str, Vec<Value>)> = (0..100).map(|i| ("getblockhash", vec![json!(i)])).collect();
-    match rpc.batch::<String>(&calls).await {
+    match rpc.batch::<String>(&calls, rpc.timeout()).await {
         Ok(res) => {
             let ok = res.iter().filter(|x| x.is_ok()).count();
             r.add("JSON-RPC batch of 100", if ok == 100 { Status::Yes } else { Status::Warn }, format!("{ok}/100 results"));

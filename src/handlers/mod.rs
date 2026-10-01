@@ -1,4 +1,5 @@
 pub mod address;
 pub mod blocks;
+pub mod health;
 pub mod search;
 pub mod tx;
